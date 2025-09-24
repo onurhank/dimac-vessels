@@ -129,6 +129,7 @@ bash run_vessel_analysis.sh \
   * Renders: static PNG + spinning GIF
 
 ---
+<img width="384" height="580" alt="Ekran Resmi 2025-09-24 14 35 33" src="https://github.com/user-attachments/assets/ecb8f81d-e5e2-4db6-9eee-7e04e391e7ff" />
 
 ## 🧩 Roadmap
 
