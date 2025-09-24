@@ -22,3 +22,21 @@ out/
 
 # OS files
 .DS_Store
+# Builds / outputs
+analysis_output/
+derivatives/
+
+# Backups / copies
+*.bak
+* (Kopie).sh
+
+# OS junk
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Big images / previews (gerekirse aç)
+# *_preview.png
