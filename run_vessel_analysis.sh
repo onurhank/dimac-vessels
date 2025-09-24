@@ -26,6 +26,18 @@ PPR_THR=4
 K_CLUSTERS=4
 VESSELNESS_SCALES="1 2 3 4 5 6"
 PATH_THICKEN_VOX=1
+# --- Tunables for clustering (override as needed) ---
+K_CLUSTERS=${K_CLUSTERS:-5}
+
+# ACA tends to be smaller; a bit stricter PPR and a midline prior help avoid MCA
+PPR_THR_ACA=${PPR_THR_ACA:-8}       # try 8–12; was 3 before (quite low)
+MIN_VOX_ACA=${MIN_VOX_ACA:-80}      # ACA size floor
+MIDLINE_FRAC=${MIDLINE_FRAC:-0.20}  # ~20% of FOV around midline (assumes X is L–R)
+Z_FRAC=${Z_FRAC:-0.50}              # central Z slab (optional)
+
+# ICA can be larger
+PPR_THR_ICA=${PPR_THR_ICA:-10}
+MIN_VOX_ICA=${MIN_VOX_ICA:-150}
 
 # --- Args ---
 while [[ $# -gt 0 ]]; do
