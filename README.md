@@ -87,11 +87,79 @@ bash run_vessel_analysis.sh \
 - [ ] Add CI/CD with GitHub Actions  
 
 ---
+Required Inputs
+TOF angiography scan (--tof)
 
-## 👤 Author
-- **Onurhan Karatay** ([@onurhank](https://github.com/onurhank))  
 
----
+A 3D NIfTI (.nii.gz) from Time-of-Flight MRA.
 
-## 📄 License
-This project is licensed under the [Apache 2.0 License](LICENSE).
+
+Example: sub-001_TOF.nii.gz
+
+
+DIMAC BOLD for ACA (--dimac-aca)
+
+
+The fMRI/DIMAC series that covers the Anterior Cerebral Artery region.
+
+
+Example: sub-001_task-dimac_ACA_bold.nii.gz
+
+
+DIMAC BOLD for ICA (--dimac-ica)
+
+
+The fMRI/DIMAC series that covers the Internal Carotid Artery region.
+
+
+Example: sub-001_task-dimac_ICA_bold.nii.gz
+
+
+
+Optional Inputs
+ACA ROI mask (--aca-roi)
+
+
+A binary mask (NIfTI) defining ACA ROI, if you don’t want the script to generate it.
+
+
+Must align with TOF, TOF-isotropic or DIMAC space (script will auto-detect and resample).
+
+
+ICA ROI mask (--ica-roi)
+
+
+A binary mask (NIfTI) defining ICA ROI, same rules as above.
+
+
+Subject ID (--sub-id)
+
+
+String label used in naming outputs. Default = sub-default.
+
+
+Output directories:
+
+
+--deriv-dir (default: derivatives) → intermediate files
+
+
+--out-dir (default: analysis_output) → vesselness maps, path, renders
+
+
+
+Minimal Example Run
+bash run_vessel_analysis.sh \
+  --tof /data/sub-001_TOF.nii.gz \
+  --dimac-aca /data/sub-001_dimac_ACA_bold.nii.gz \
+  --dimac-ica /data/sub-001_dimac_ICA_bold.nii.gz \
+  --sub-id sub-001
+
+Example With Pre-made ROIs
+bash run_vessel_analysis.sh \
+  --tof /data/sub-001_TOF.nii.gz \
+  --dimac-aca /data/sub-001_dimac_ACA_bold.nii.gz \
+  --dimac-ica /data/sub-001_dimac_ICA_bold.nii.gz \
+  --aca-roi /data/sub-001_ACA_mask.nii.gz \
+  --ica-roi /data/sub-001_ICA_mask.nii.gz \
+  --sub-id sub-001
