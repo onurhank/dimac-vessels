@@ -11,22 +11,21 @@ Outputs:
   <out>_summary.txt                 -- detailed report (TR, band, threshold, k, sizes, QA metrics)
   <out>_preview.png                 -- middle-slice preview overlay
 
-Key improvements:
-- NaN-safe processing throughout.
-- Optional auto-band detection around cardiac peak with adaptive bandwidth (and DC/Nyquist safety).
-- Optional Welch PSD re-estimation of PPR inside gate for robustness (heavier).
-- PCA randomized solver + KMeans n_init='auto' for stability/performance.
-- Composite scoring (mean PPR + peak sharpness + centroid proximity) when auto-band is on.
-- Morphological cleanup: largest 3D CC + remove small objects.
+Key extras in this version:
+- --center-frac: restrict search to a centered XY square (anatomical prior for ACA).
+- --min-voxels: guaranteed ROI by seeding at max-PPR and dilating until >= N voxels.
+- Robust FFT-based PPR + optional Welch PSD refinement inside the gate.
+- PCA(+randomized) + KMeans clustering; pick best cluster by PPR (with coherence bonus in auto-band).
+- Conservative morphology: largest 3D CC + remove tiny islands + light open/close.
 
 Dependencies: nibabel, numpy, scipy, scikit-learn, scikit-image, matplotlib
 """
 
 import argparse
-import numpy as np
-import nibabel as nib
 import os
 import sys
+import numpy as np
+import nibabel as nib
 import matplotlib.pyplot as plt
 
 from numpy.fft import rfft, rfftfreq
@@ -36,13 +35,14 @@ from sklearn.decomposition import PCA
 from sklearn.metrics import silhouette_score
 
 from skimage.measure import label as cc_label
-from skimage.morphology import ball, binary_opening, binary_closing, remove_small_objects
+from skimage.morphology import ball, binary_opening, binary_closing, remove_small_objects, binary_dilation
+
 
 # ----------------- I/O helpers -----------------
 
 def load_nii(path):
     nii = nib.load(path)
-    data = nii.get_fdata(dtype=np.float32)  # memmap ok
+    data = nii.get_fdata(dtype=np.float32)
     return nii, data
 
 def save_nii_like(ref_nii, data, out_path, dtype=None):
@@ -50,6 +50,8 @@ def save_nii_like(ref_nii, data, out_path, dtype=None):
         data = data.astype(dtype)
     out = nib.Nifti1Image(data, ref_nii.affine, ref_nii.header)
     nib.save(out, out_path)
+    # print(f"Saved: {out_path}")
+
 
 # ----------------- Utilities -----------------
 
@@ -62,60 +64,51 @@ def _zscore_safe(x):
     sd = np.nanstd(x) + 1e-12
     return (x - mu) / sd
 
+
 # ----------------- Band estimation (auto) -----------------
 
 def estimate_cardio_band_from_global(dimac_4d, tr_sec, f_lo_hz=0.5, f_hi_hz=3.0):
     """
-    Estimate cardiac peak frequency and an adaptive bandwidth from the global signal PSD.
-    Returns (f0_hz, df_hz) with DC/Nyquist safety.
+    Estimate cardiac peak frequency and an adaptive half-width from the global signal PSD.
+    Returns (f0_hz, df_hz).
     """
     T = dimac_4d.shape[3]
     fs = 1.0 / tr_sec
     freqs = rfftfreq(T, d=tr_sec)
     nyq = freqs[-1]
 
-    # global signal
+    # global mean signal
     g = np.nanmean(dimac_4d, axis=(0, 1, 2))
     g = detrend(np.nan_to_num(g, nan=0.0), type="linear")
 
-    # plain FFT power for robust peak finding (fast)
+    # FFT power
     spec = rfft(g)
     pow_g = (spec.real**2 + spec.imag**2)
 
-    # search window (Hz), clip to realizable bins & avoid DC bin
+    # search window, avoid DC
     lo = max(f_lo_hz, freqs[1] if freqs.size > 1 else 0.0)
     hi = min(f_hi_hz, nyq)
     mask = (freqs >= lo) & (freqs <= hi)
     if not np.any(mask):
-        raise ValueError(f"Auto-band search range empty for TR={tr_sec:.4f}s (nyquist={nyq:.2f}Hz).")
+        raise ValueError(f"Auto-band search empty for TR={tr_sec:.4f}s (nyquist={nyq:.2f}Hz).")
 
     f_m = freqs[mask]
     P_m = pow_g[mask]
 
-    # peaks by prominence; fallback to absolute max if no prominences
     prom_thr = np.percentile(P_m, 75.0)
     peaks, props = find_peaks(P_m, prominence=max(prom_thr, 1e-12))
     if peaks.size == 0:
         peak_idx = int(np.argmax(P_m))
         f0 = float(f_m[peak_idx])
-        prominence = float(np.max(P_m) - np.median(P_m))
     else:
-        # most prominent peak
         best = int(np.argmax(props["prominences"]))
         peak_idx = peaks[best]
         f0 = float(f_m[peak_idx])
-        prominence = float(props["prominences"][best])
 
-    # adaptive half-width (Hz): proportional to f0 with lower bound
+    # adaptive half-width
     df = max(0.15, 0.20 * f0)  # ~9–18 bpm typical
-    # clip to realizable range
-    f_lo = max(f0 - df, lo)
-    f_hi = min(f0 + df, hi)
-    # if clipping inverted the window (pathological), fallback to a narrow window
-    if f_hi <= f_lo:
-        f_lo = max(lo, f0 - 0.2)
-        f_hi = min(hi, f0 + 0.2)
-    return (f0, f_hi - f0)  # center + half-width
+    return f0, df
+
 
 # ----------------- PPR computation -----------------
 
@@ -131,15 +124,13 @@ def compute_ppr_fft(dimac_4d, tr_sec, bpm_lo=40.0, bpm_hi=120.0):
         raise ValueError("TR (sec) must be > 0.")
 
     freqs = rfftfreq(T, d=tr_sec)
-    nyq_bpm = 60.0 * freqs[-1]
-
     # clip band to realizable range and avoid DC bin
     lo_hz = max(bpm_lo/60.0, freqs[1] if freqs.size > 1 else 0.0)
     hi_hz = min(bpm_hi/60.0, freqs[-1])
     if hi_hz <= lo_hz:
         raise ValueError(
             f"Requested band {bpm_lo:.1f}-{bpm_hi:.1f} bpm not representable at TR={tr_sec:.4f}s "
-            f"(Nyquist {nyq_bpm:.1f} bpm)."
+            f"(Nyquist {60.0*freqs[-1]:.1f} bpm)."
         )
 
     # reshape to (V, T)
@@ -158,16 +149,16 @@ def compute_ppr_fft(dimac_4d, tr_sec, bpm_lo=40.0, bpm_hi=120.0):
     total_power = np.sum(power[:, non_dc], axis=1) + 1e-12
     ppr = 100.0 * band_power / total_power  # percent
     ppr_3d = ppr.reshape((X, Y, Z))
-    return ppr_3d, (lo_hz*60.0, hi_hz*60.0, nyq_bpm)
+    return ppr_3d, (lo_hz*60.0, hi_hz*60.0, 60.0*freqs[-1])
+
 
 def recompute_ppr_welch_in_gate(dimac_4d, gate_mask, tr_sec, lo_hz, hi_hz):
     """
-    Heavier but more robust PPR via Welch PSD, computed only for voxels inside the gate.
-    Returns a new PPR volume where gate voxels are replaced with Welch-based PPR.
+    More robust PPR via Welch PSD, computed only for voxels inside the gate.
+    Returns a volume with Welch-based PPR inside the gate and zeros elsewhere.
     """
     X, Y, Z, T = dimac_4d.shape
     fs = 1.0 / tr_sec
-    freqs = None
 
     out = np.zeros((X, Y, Z), dtype=np.float32)
     gate_idx = np.flatnonzero(gate_mask.ravel())
@@ -179,28 +170,25 @@ def recompute_ppr_welch_in_gate(dimac_4d, gate_mask, tr_sec, lo_hz, hi_hz):
     ts = np.where(np.isfinite(ts), ts, 0.0)
     ts = detrend(ts, axis=1, type='linear')
 
-    # Welch parameters (balance resolution vs variance)
+    # Welch parameters
     nperseg = min(256, T)
     noverlap = int(0.5 * nperseg)
     win = get_window('hann', nperseg)
 
-    # compute voxel-wise Welch
     band_power = np.zeros(gate_idx.size, dtype=np.float64)
     total_power = np.zeros(gate_idx.size, dtype=np.float64)
 
     for i in range(gate_idx.size):
         f, Pxx = welch(ts[i, :], fs=fs, window=win, nperseg=nperseg, noverlap=noverlap, detrend=False)
-        if freqs is None:
-            freqs = f
         non_dc = f > 0
         m_band = (f >= lo_hz) & (f <= hi_hz)
-        # integrate (trapz) to approximate band/total power
         band_power[i] = np.trapz(Pxx[m_band], f[m_band])
         total_power[i] = np.trapz(Pxx[non_dc], f[non_dc]) + 1e-18
 
     ppr_gate = 100.0 * (band_power / total_power)
     out.reshape(-1)[gate_idx] = ppr_gate.astype(np.float32)
     return out
+
 
 # ----------------- Clustering inside gate -----------------
 
@@ -234,49 +222,15 @@ def kmeans_in_gate(dimac_4d, gate_mask, k=5, use_pca=True, pca_var=0.9, random_s
     else:
         Xk = ts
 
-    km = KMeans(n_clusters=k, n_init='auto', random_state=random_state)
+    km = KMeans(n_clusters=k, n_init='auto' if hasattr(KMeans(), 'n_init') else 10, random_state=random_state)
     labels = km.fit_predict(Xk)  # 0..k-1
 
     label_vol = np.zeros((X, Y, Z), dtype=np.int16)
-    label_vol.reshape(-1)[gate_idx] = labels.astype(np.int16) + 1  # 1..k
+    label_vol.reshape(-1)[gate_idx] = (labels.astype(np.int16) + 1)  # 1..k
     return label_vol, Xk, labels, gate_idx
 
-# ----------------- Scoring & ROI selection -----------------
 
-def compute_cluster_scores(label_vol, ppr_3d, gate_idx, labels, lo_hz, hi_hz, tr_sec, Xk=None, use_centroid=False, use_sharpness=False):
-    """
-    Compute per-cluster metrics inside gate: mean PPR, (optional) spectral centroid distance to band center,
-    (optional) peak sharpness proxy.
-    Returns report list: (label, voxel_count, mean_PPR, score, centroid_diff_hz, sharpness)
-    """
-    k = int(label_vol.max())
-    report = []
-    band_center = 0.5 * (lo_hz + hi_hz)
-
-    # prepare centroid & sharpness metrics if requested (only if Xk not None and we can recompute PSD cheaply)
-    centroid = {}
-    sharp = {}
-
-    # For centroid/sharpness we’ll approximate from FFT of cluster-mean signal
-    # (good trade-off between cost and usefulness).
-    if use_centroid or use_sharpness:
-        # find T from any gate voxel
-        T = label_vol.size // label_vol.shape[2]  # not robust; instead:
-        # better: re-derive T from ppr_3d-matched volume:
-        # we don't need T; we'll compute centroid from per-cluster mean of full time series in main()
-        pass
-
-    for lab in range(1, k+1):
-        mask = (label_vol == lab)
-        count = int(mask.sum())
-        if count == 0:
-            report.append((lab, 0, 0.0, -np.inf, np.nan, np.nan))
-            continue
-        mean_ppr = float(np.nanmean(ppr_3d[mask]))
-        # basic score = mean PPR
-        score = mean_ppr
-        report.append((lab, count, mean_ppr, score, np.nan, np.nan))
-    return report
+# ----------------- ROI cleanup -----------------
 
 def refine_roi_largest_cc(roi_bool, min_cc_size=0, apply_open_close=True):
     """
@@ -297,6 +251,7 @@ def refine_roi_largest_cc(roi_bool, min_cc_size=0, apply_open_close=True):
         roi_bool = binary_closing(roi_bool, ball(1))
     return roi_bool
 
+
 # ----------------- Preview -----------------
 
 def preview_png(bg_vol, roi_mask, out_png):
@@ -314,6 +269,7 @@ def preview_png(bg_vol, roi_mask, out_png):
     plt.savefig(out_png, dpi=150)
     plt.close(fig)
 
+
 # ----------------- Main -----------------
 
 def main():
@@ -328,11 +284,17 @@ def main():
     ap.add_argument("--no-pca", action="store_true", help="Disable PCA before k-means (slower).")
     ap.add_argument("--pca-var", type=float, default=0.90, help="Target explained variance if PCA enabled (default 0.90).")
     ap.add_argument("--random-state", type=int, default=0)
-    # new / improved options
     ap.add_argument("--auto-band", action="store_true", help="Auto-detect cardiac peak and adaptive band from global PSD.")
     ap.add_argument("--welch-in-gate", action="store_true",
                     help="Recompute PPR with Welch PSD for voxels inside the gate (heavier, more robust).")
     ap.add_argument("--min-cc-size", type=int, default=0, help="Remove connected components smaller than this voxel count (after largest CC).")
+
+    # NEW: Robustness arguments to guarantee an ROI is created
+    ap.add_argument("--center-frac", type=float, default=None,
+                    help="If set (0<frac<=1), intersect gate with a centered XY square (frac*FOV).")
+    ap.add_argument("--min-voxels", type=int, default=0,
+                    help="If gate ends empty/small, seed at max-PPR and dilate until >= this many voxels.")
+
     args = ap.parse_args()
 
     # load DIMAC
@@ -356,17 +318,17 @@ def main():
         hi_hz = min(f0_hz + df_hz, 0.5 * fs)
         bpm_lo_eff, bpm_hi_eff = lo_hz * 60.0, hi_hz * 60.0
     else:
-        # use user-provided BPM band with DC/Nyquist safety
         lo_hz = max(args.bpm_low/60.0, (1.0/T)/tr if T > 1 else 0.0)
         hi_hz = min(args.bpm_high/60.0, 0.5 * fs)
         bpm_lo_eff, bpm_hi_eff = lo_hz * 60.0, hi_hz * 60.0
 
     # compute PPR (fast FFT)
-    ppr, (_, _, nyq_bpm) = compute_ppr_fft(X, tr, bpm_lo=bpm_lo_eff, bpm_hi=bpm_hi_eff)
+    ppr, (_, _, _) = compute_ppr_fft(X, tr, bpm_lo=bpm_lo_eff, bpm_hi=bpm_hi_eff)
     save_nii_like(dimac_nii, ppr, f"{args.out}_ppr.nii.gz", dtype=np.float32)
 
     # gate by PPR >= threshold%
     gate = ppr >= float(args.ppr_thr)
+    vm = None  # optional vessel mask
 
     # optional: intersect with external vessel mask
     if args.vessel_mask:
@@ -376,79 +338,125 @@ def main():
             sys.exit(1)
         gate = gate & (vm > 0)
 
-    # clean small speckles a bit (very conservative)
+    # NEW: restrict to a centered XY square if requested (anatomical prior for ACA)
+    if args.center_frac is not None:
+        cf = float(args.center_frac)
+        if not (0.0 < cf <= 1.0):
+            print("Error: --center-frac must be in (0,1].", file=sys.stderr); sys.exit(1)
+        Xd, Yd, Zd = X.shape[:3]
+        cx, cy = Xd // 2, Yd // 2
+        hx = max(1, int(round(0.5 * cf * Xd)))
+        hy = max(1, int(round(0.5 * cf * Yd)))
+        xmin, xmax = max(0, cx - hx), min(Xd, cx + hx)
+        ymin, ymax = max(0, cy - hy), min(Yd, cy + hy)
+        center_mask = np.zeros((Xd, Yd, Zd), dtype=bool)
+        center_mask[xmin:xmax, ymin:ymax, :] = True
+        gate = gate & center_mask
+
+    # clean small speckles a bit
     gate = binary_opening(gate, ball(1))
     save_nii_like(dimac_nii, gate.astype(np.uint8), f"{args.out}_ppr_thresh.nii.gz", dtype=np.uint8)
 
-    # optional: recompute PPR in gate with Welch (heavier but more robust)
+    # NEW: force-build a minimal gate if it's too small or empty
+    if args.min_voxels > 0 and np.count_nonzero(gate) < int(args.min_voxels):
+        print(f"[INFO] Gate has {np.count_nonzero(gate)} voxels < --min-voxels={args.min_voxels}. Forcing ROI seed+dilate.")
+        Xd, Yd, Zd = X.shape[:3]
+
+        # seed search domain
+        if args.center_frac is not None:
+            cf = float(args.center_frac)
+            cx, cy = Xd // 2, Yd // 2
+            hx = max(1, int(round(0.5 * cf * Xd)))
+            hy = max(1, int(round(0.5 * cf * Yd)))
+            xmin, xmax = max(0, cx - hx), min(Xd, cx + hx)
+            ymin, ymax = max(0, cy - hy), min(Yd, cy + hy)
+            seed_domain = np.zeros((Xd, Yd, Zd), dtype=bool)
+            seed_domain[xmin:xmax, ymin:ymax, :] = True
+        elif vm is not None:
+            seed_domain = (vm > 0)
+        else:
+            seed_domain = np.ones((Xd, Yd, Zd), dtype=bool)
+
+        # find best seed (max PPR) in domain
+        ppr_masked = np.where(seed_domain, ppr, -np.inf)
+        if not np.any(np.isfinite(ppr_masked)):
+            ppr_masked = ppr
+        seed_idx = np.unravel_index(int(np.nanargmax(ppr_masked)), ppr.shape)
+
+        # grow by 1-voxel dilations until min_voxels
+        roi_force = np.zeros_like(gate, dtype=bool)
+        roi_force[seed_idx] = True
+        iters, max_iters = 0, 50
+        while np.count_nonzero(roi_force) < int(args.min_voxels) and iters < max_iters:
+            roi_force = binary_dilation(roi_force, footprint=ball(1))
+            iters += 1
+
+        gate = roi_force  # replace gate
+        save_nii_like(dimac_nii, gate.astype(np.uint8), f"{args.out}_forced_gate.nii.gz", dtype=np.uint8)
+
+    # optional: recompute PPR inside gate with Welch (heavier, robust)
     if args.welch_in_gate and gate.any():
+        # reuse exact lo/hi Hz that were computed above (auto-band or manual)
         ppr_welch_gate = recompute_ppr_welch_in_gate(X, gate, tr, lo_hz, hi_hz)
-        # blend: replace FFT-PPR by Welch-PPR inside gate
         ppr = np.where(gate, ppr_welch_gate, ppr)
-        # re-save blended PPR map for transparency
         save_nii_like(dimac_nii, ppr.astype(np.float32), f"{args.out}_ppr.nii.gz", dtype=np.float32)
 
-    # run k-means inside gate
+    # final safeguard before clustering
+    if np.count_nonzero(gate) == 0:
+        print("[WARN] Gate is empty after all attempts. Creating single-voxel ROI at global max PPR.")
+        seed_idx = np.unravel_index(int(np.nanargmax(ppr)), ppr.shape)
+        roi_mask = np.zeros_like(gate, dtype=bool)
+        roi_mask[seed_idx] = True
+        save_nii_like(dimac_nii, roi_mask.astype(np.uint8), f"{args.out}_roi.nii.gz", dtype=np.uint8)
+        ts = X[seed_idx[0], seed_idx[1], seed_idx[2], :]
+        np.savetxt(f"{args.out}_roi_timeseries.csv", ts, delimiter=",", fmt="%.6f")
+        with open(f"{args.out}_summary.txt", "w") as f:
+            f.write("FORCED single-voxel ROI due to empty gate.\n")
+        bg = np.nanmean(X, axis=3)
+        preview_png(bg, roi_mask, f"{args.out}_preview.png")
+        print("Done (forced single-voxel ROI).")
+        return
+
+    # clustering
     labels_vol, Xk, labels, gate_idx = kmeans_in_gate(
-        X,
-        gate,
-        k=args.k,
-        use_pca=(not args.no_pca),
-        pca_var=args.pca_var,
-        random_state=args.random_state,
+        X, gate, k=args.k, use_pca=(not args.no_pca),
+        pca_var=args.pca_var, random_state=args.random_state
     )
     save_nii_like(dimac_nii, labels_vol, f"{args.out}_kmeans_k{args.k}.nii.gz", dtype=np.int16)
 
-    # pick best cluster by mean PPR (composite scoring if auto-band was used)
-    # basic report uses mean PPR; composite score calculation can be expanded here if desired.
+    # pick best cluster by mean PPR (bonus: coherence if auto-band)
     cluster_report = []
     kmax = int(labels_vol.max())
-    best_label = None
-    best_score = -np.inf
-
-    for lab in range(1, kmax+1):
+    best_label, best_score = None, -np.inf
+    for lab in range(1, kmax + 1):
         M = (labels_vol == lab)
         if not np.any(M):
             cluster_report.append((lab, 0, 0.0))
             continue
         mean_ppr = float(np.nanmean(ppr[M]))
-        score = mean_ppr  # base
-
-        # optional composite scoring: emphasize voxels concentrated near band center (auto-band)
+        score = mean_ppr
         if args.auto_band:
-            # approximate peak sharpness via variance of PPR in cluster (lower variance ~ more coherent)
             ppr_vals = ppr[M]
             sharp = float(1.0 / (np.nanstd(ppr_vals) + 1e-6))
-            # simple composite (weights can be tuned)
             score = 0.8 * mean_ppr + 0.2 * (10.0 * sharp)
-
         cluster_report.append((lab, int(M.sum()), mean_ppr))
         if score > best_score:
             best_score = score
             best_label = lab
 
     roi_mask = (labels_vol == best_label)
-
-    # keep largest 3D CC, remove tiny islands, light open/close
     roi_mask = refine_roi_largest_cc(roi_mask, min_cc_size=args.min_cc_size, apply_open_close=True)
-
-    # save ROI
     save_nii_like(dimac_nii, roi_mask.astype(np.uint8), f"{args.out}_roi.nii.gz", dtype=np.uint8)
 
     # export mean time series
+    T = X.shape[3]
     if roi_mask.any():
         ts_mean = X[roi_mask, :].mean(axis=0)
     else:
         ts_mean = np.zeros(T, dtype=np.float32)
     np.savetxt(f"{args.out}_roi_timeseries.csv", ts_mean, delimiter=",", fmt="%.6f")
 
-    # silhouette (in PCA-space) as a clustering quality metric
-    try:
-        sil = float(silhouette_score(Xk, labels, metric='euclidean')) if len(np.unique(labels)) > 1 else np.nan
-    except Exception:
-        sil = np.nan
-
-    # QA: ROI volume (mL) and CoM
+    # summary
     vx = np.array(dimac_nii.header.get_zooms()[:3], dtype=np.float64)
     roi_vox = int(roi_mask.sum())
     roi_ml = float(roi_vox * np.prod(vx) / 1000.0)
@@ -460,35 +468,41 @@ def main():
         com_ijk = np.array([np.nan, np.nan, np.nan])
         com_xyz = np.array([np.nan, np.nan, np.nan])
 
-    # write summary
     with open(f"{args.out}_summary.txt", "w") as f:
         f.write(f"DIMAC shape: {X.shape}\n")
         f.write(f"TR (s): {tr:.6f}\n")
-        f.write(f"Nyquist (bpm): {nyq_bpm:.2f}\n")
         f.write(f"Band used (BPM): {bpm_lo_eff:.1f}..{bpm_hi_eff:.1f}\n")
         f.write(f"PPR threshold (%): {args.ppr_thr}\n")
         f.write(f"K-means K: {args.k}\n")
         f.write(f"Best cluster label: {best_label}\n")
         for lab, count, mean_ppr in cluster_report:
             f.write(f"  label {lab}: voxels={count}, mean_PPR%={mean_ppr:.3f}\n")
+        try:
+            sil = float(silhouette_score(Xk, labels, metric='euclidean')) if len(np.unique(labels)) > 1 else np.nan
+        except Exception:
+            sil = np.nan
         f.write(f"Silhouette (PCA-space): {sil:.3f}\n")
         f.write(f"ROI voxels: {roi_vox}\n")
         f.write(f"ROI volume (mL): {roi_ml:.3f}\n")
         f.write(f"ROI CoM (ijk): {com_ijk.tolist()}\n")
         f.write(f"ROI CoM (world, mm): {com_xyz.tolist()}\n")
         f.write(f"Auto-band: {bool(args.auto_band)} | Welch-in-gate: {bool(args.welch_in_gate)}\n")
+        if args.center_frac is not None:
+            f.write(f"center-frac: {args.center_frac}\n")
+        if args.min_voxels > 0:
+            f.write(f"min-voxels: {args.min_voxels}\n")
 
     # preview
     bg = np.nanmean(X, axis=3)
     preview_png(bg, roi_mask, f"{args.out}_preview.png")
 
     print(f"Done.\nROI saved to: {args.out}_roi.nii.gz")
-    print(f"PPR map: {args.out}_ppr.nii.gz  |  Gate: {args.out}_ppr_thresh.nii.gz")
-    print(f"KMeans labels: {args.out}_kmeans_k{args.k}.nii.gz")
-    print(f"Timeseries: {args.out}_roi_timeseries.csv")
-    print(f"Summary: {args.out}_summary.txt")
-    print(f"Preview: {args.out}_preview.png")
+
 
 if __name__ == "__main__":
-    main()
-
+    try:
+        main()
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)

@@ -1,353 +1,292 @@
 #!/bin/bash
 # ==============================================================================
-#
-#           DIMAC Vessel Analysis Pipeline - Main Wrapper Script
-#
-# This script orchestrates the entire vessel analysis workflow, from initial
-# preprocessing and ROI generation to final shortest-path tracking and
-# visualization.
-#
-# Workflow Steps:
-#   1. Resample the anatomical TOF scan to be isotropic.
-#   2. Calculate a vesselness map (Frangi) from the isotropic TOF.
-#   3. (Conditional) Generate territory-constrained ROIs (ACA/ICA) from 4D DIMAC data.
-#      - This step is skipped if --aca-roi and --ica-roi are provided.
-#   4. Resample all ROIs into the common isotropic TOF space.
-#   5. Find the shortest path between the ROIs and render PNG/GIF outputs.
-#
-# Usage Example (generating ROIs):
-#   ./run_vessel_analysis.sh \
-#       --tof data/MRI_tof.nii.gz \
-#       --dimac-aca data/func/sub-XYZ_acq-dimacACA_bold.nii.gz \
-#       --dimac-ica data/func/sub-XYZ_acq-dimacICA_bold.nii.gz \
-#       --aca-mask data/masks/ACA_dimac.nii.gz \
-#       --ica-mask data/masks/ICA_dimac.nii.gz
-#
-# Usage Example (with pre-existing DIMAC-space ROIs):
-#   ./run_vessel_analysis.sh \
-#       --tof data/MRI_tof.nii.gz \
-#       --dimac-aca data/func/sub-XYZ_acq-dimacACA_bold.nii.gz \
-#       --dimac-ica data/func/sub-XYZ_acq-dimacICA_bold.nii.gz \
-#       --aca-roi my_preexisting_aca_roi_dimac.nii.gz --aca-roi-space dimac \
-#       --ica-roi my_preexisting_ica_roi_dimac.nii.gz --ica-roi-space dimac
-#
-# Usage Example (with pre-existing TOF-space ROIs):
-#   ./run_vessel_analysis.sh \
-#       --tof data/MRI_tof.nii.gz \
-#       --dimac-aca data/func/sub-XYZ_acq-dimacACA_bold.nii.gz \
-#       --dimac-ica data/func/sub-XYZ_acq-dimacICA_bold.nii.gz \
-#       --aca-roi my_preexisting_aca_roi_tof.nii.gz --aca-roi-space tof \
-#       --ica-roi my_preexisting_ica_roi_tof.nii.gz --ica-roi-space tof
-#
+# DIMAC Vessel Analysis Pipeline - Main Wrapper (idempotent + auto ROI space)
 # ==============================================================================
 
-# --- Script Setup ---
-# Exit immediately if a command fails
-set -e
-# Treat unset variables as an error
-set -u
-# The exit status of a pipeline is the status of the last command to fail
-set -o pipefail
+set -Eeuo pipefail
+trap 'echo "[FATAL] $(date -Is) line:$LINENO cmd:$BASH_COMMAND" >&2' ERR
+export MPLBACKEND=Agg
 
-# --- Default Configuration ---
-# These are default values. Command-line arguments will override them.
+# --- Defaults ---
 TOF_RAW=""
 DIMAC_ICA_BOLD=""
 DIMAC_ACA_BOLD=""
-ACA_TERRITORY_MASK="" # Used for auto-ROI if no --aca-roi
-ICA_TERRITORY_MASK="" # Used for auto-ROI if no --ica-roi
 
-ACA_ROI_INPUT=""      # Path to pre-existing ACA ROI (if provided)
-ACA_ROI_INPUT_SPACE="" # Space of ACA_ROI_INPUT (dimac or tof)
-ICA_ROI_INPUT=""      # Path to pre-existing ICA ROI (if provided)
-ICA_ROI_INPUT_SPACE="" # Space of ICA_ROI_INPUT (dimac or tof)
+ACA_ROI_INPUT=""
+ACA_ROI_INPUT_SPACE=""   # kept for compatibility (not required)
+ICA_ROI_INPUT=""
+ICA_ROI_INPUT_SPACE=""   # kept for compatibility (not required)
 
-# --- General Parameters ---
-SUB_ID="sub-2843808" # Default subject ID, can be overridden or derived
+SUB_ID="sub-default"
 SCRIPT_DIR="scripts"
 DERIV_DIR="derivatives"
 OUT_DIR="analysis_output"
 
-# --- Algorithm-specific Parameters ---
 PPR_THR=4
 K_CLUSTERS=4
 VESSELNESS_SCALES="1 2 3 4 5 6"
 PATH_THICKEN_VOX=1
 
-# ==============================================================================
-# --- Command-Line Argument Parsing ---
-# ==============================================================================
-
+# --- Args ---
 while [[ $# -gt 0 ]]; do
-    key="$1"
-    case $key in
-        --tof)
-            TOF_RAW="$2"
-            shift # past argument
-            shift # past value
-            ;;
-        --dimac-aca)
-            DIMAC_ACA_BOLD="$2"
-            shift
-            shift
-            ;;
-        --dimac-ica)
-            DIMAC_ICA_BOLD="$2"
-            shift
-            shift
-            ;;
-        --aca-mask) # Territory mask for auto-ROI
-            ACA_TERRITORY_MASK="$2"
-            shift
-            shift
-            ;;
-        --ica-mask) # Territory mask for auto-ROI
-            ICA_TERRITORY_MASK="$2"
-            shift
-            shift
-            ;;
-        --aca-roi) # Pre-existing ACA ROI
-            ACA_ROI_INPUT="$2"
-            shift
-            shift
-            ;;
-        --aca-roi-space) # Space of pre-existing ACA ROI
-            ACA_ROI_INPUT_SPACE="$2"
-            shift
-            shift
-            ;;
-        --ica-roi) # Pre-existing ICA ROI
-            ICA_ROI_INPUT="$2"
-            shift
-            shift
-            ;;
-        --ica-roi-space) # Space of pre-existing ICA ROI
-            ICA_ROI_INPUT_SPACE="$2"
-            shift
-            shift
-            ;;
-        --sub-id) # Override default subject ID
-            SUB_ID="$2"
-            shift
-            shift
-            ;;
-        --scripts-dir) # Override default scripts directory
-            SCRIPT_DIR="$2"
-            shift
-            shift
-            ;;
-        --deriv-dir) # Override default derivatives directory
-            DERIV_DIR="$2"
-            shift
-            shift
-            ;;
-        --out-dir) # Override default final output directory
-            OUT_DIR="$2"
-            shift
-            shift
-            ;;
-        *)
-            echo "Unknown option: $1" >&2
-            exit 1
-            ;;
-    esac
+  key="$1"
+  case $key in
+    --tof) TOF_RAW="$2"; shift; shift ;;
+    --dimac-aca) DIMAC_ACA_BOLD="$2"; shift; shift ;;
+    --dimac-ica) DIMAC_ICA_BOLD="$2"; shift; shift ;;
+    --aca-roi) ACA_ROI_INPUT="$2"; shift; shift ;;
+    --aca-roi-space) ACA_ROI_INPUT_SPACE="$2"; shift; shift ;;   # optional now
+    --ica-roi) ICA_ROI_INPUT="$2"; shift; shift ;;
+    --ica-roi-space) ICA_ROI_INPUT_SPACE="$2"; shift; shift ;;   # optional now
+    --sub-id) SUB_ID="$2"; shift; shift ;;
+    --deriv-dir) DERIV_DIR="$2"; shift; shift ;;
+    --out-dir) OUT_DIR="$2"; shift; shift ;;
+    *) echo "Unknown option: $1" >&2; exit 1 ;;
+  esac
 done
 
+echo "--- Performing pre-flight checks (idempotent + auto ROI space) ---"
+[[ -f "$TOF_RAW" ]] || { echo "[ERROR] --tof is required and must exist."; exit 1; }
+[[ -f "$DIMAC_ACA_BOLD" ]] || { echo "[ERROR] --dimac-aca is required and must exist."; exit 1; }
+[[ -f "$DIMAC_ICA_BOLD" ]] || { echo "[ERROR] --dimac-ica is required and must exist."; exit 1; }
+[[ -d "$SCRIPT_DIR" ]] || { echo "[ERROR] Scripts dir not found: $SCRIPT_DIR"; exit 1; }
+
+mkdir -p "$DERIV_DIR" "$DERIV_DIR/resampled_to_tof" "$OUT_DIR"
+
+# --- Helpers ---
+vox() { # voxel count; 0 if missing/invalid
+  local f="$1"
+  [[ -f "$f" ]] || { echo 0; return; }
+  fslstats "$f" -V 2>/dev/null | awk '{print $1+0}' || echo 0
+}
+get_dims() { fslhd "$1" | awk '/^dim1/{d1=$2}/^dim2/{d2=$2}/^dim3/{d3=$2} END{print d1,d2,d3}'; }
+get_pix()  { fslhd "$1" | awk '/^pixdim1/{p1=$2}/^pixdim2/{p2=$2}/^pixdim3/{p3=$2} END{print p1,p2,p3}'; }
+get_srow() { fslhd "$1" | awk '/^srow_x/{print $2,$3,$4,$5}
+/^srow_y/{print $2,$3,$4,$5}
+/^srow_z/{print $2,$3,$4,$5}' | tr '\n' ' '; }
+
+vec_close() { # "a1 a2" "b1 b2" tol -> 1/0
+  awk -v A="$1" -v B="$2" -v t="$3" '
+    BEGIN{split(A,a); split(B,b);
+      if (length(a)!=length(b) || length(a)==0) {print 0; exit}
+      for(i=1;i<=length(a);i++){d=a[i]-b[i]; if(d<0)d=-d; if(d>t){print 0; exit}}
+      print 1
+    }'
+}
+
+same_grid() { # fileA fileB -> 0 if same, 1 if different
+  local A="$1" B="$2"
+  local dA pA sA dB pB sB
+  dA=$(get_dims "$A"); pA=$(get_pix "$A"); sA=$(get_srow "$A")
+  dB=$(get_dims "$B"); pB=$(get_pix "$B"); sB=$(get_srow "$B")
+  [[ "$dA" == "$dB" ]] || { echo 1; return; }
+  [[ $(vec_close "$pA" "$pB" 1e-5) -eq 1 ]] || { echo 1; return; }
+  [[ $(vec_close "$sA" "$sB" 1e-2) -eq 1 ]] || { echo 1; return; }
+  echo 0
+}
+
+# Will be defined at Step 1
+TOF_ISOTROPIC=""
+
+detect_roi_space() { # roi -> TOF_ISO | TOF_RAW | ACA_DIMAC | ICA_DIMAC | UNKNOWN
+  local ROI="$1"
+  local s_iso=1 s_raw=1 s_aca=1 s_ica=1
+  [[ -n "$TOF_ISOTROPIC" && -f "$TOF_ISOTROPIC" ]] && s_iso=$(same_grid "$ROI" "$TOF_ISOTROPIC") || s_iso=1
+  s_raw=$(same_grid "$ROI" "$TOF_RAW") || s_raw=1
+  s_aca=$(same_grid "$ROI" "$DIMAC_ACA_BOLD") || s_aca=1
+  s_ica=$(same_grid "$ROI" "$DIMAC_ICA_BOLD") || s_ica=1
+  if [[ $s_iso -eq 0 ]]; then echo "TOF_ISO"; return; fi
+  if [[ $s_raw -eq 0 ]]; then echo "TOF_RAW"; return; fi
+  if [[ $s_aca -eq 0 ]]; then echo "ACA_DIMAC"; return; fi
+  if [[ $s_ica -eq 0 ]]; then echo "ICA_DIMAC"; return; fi
+  echo "UNKNOWN"
+}
+
+copy_if_exists() { # src dst (only if dst missing or empty)
+  local src="$1" dst="$2"
+  if [[ -f "$dst" && $(vox "$dst") -gt 0 ]]; then
+    echo "[SKIP] $dst exists (vox>0)."
+  else
+    cp -f "$src" "$dst"
+    echo "[COPY] $src -> $dst"
+  fi
+}
+
 # ==============================================================================
-# --- Pre-Flight Checks & Setup ---
+# STEP 1: TOF -> isotropic
 # ==============================================================================
-
-echo "--- Performing pre-flight checks... ---"
-
-# Check for essential input files
-if [ -z "${TOF_RAW}" ]; then echo "[ERROR] --tof is required." >&2; exit 1; fi
-if [ -z "${DIMAC_ACA_BOLD}" ]; then echo "[ERROR] --dimac-aca is required." >&2; exit 1; fi
-if [ -z "${DIMAC_ICA_BOLD}" ]; then echo "[ERROR] --dimac-ica is required." >&2; exit 1; fi
-
-for f in "${TOF_RAW}" "${DIMAC_ACA_BOLD}" "${DIMAC_ICA_BOLD}"; do
-    if [ ! -f "${f}" ]; then
-        echo "[ERROR] Required input file not found: ${f}" >&2
-        exit 1
-    fi
-done
-
-# Check scripts directory
-if [ ! -d "${SCRIPT_DIR}" ]; then
-    echo "[ERROR] Scripts directory not found at: ${SCRIPT_DIR}" >&2
-    exit 1
-fi
-
-# Determine if ROIs are pre-existing or need generation
-ROIS_PROVIDED=false
-if [ -n "${ACA_ROI_INPUT}" ] && [ -n "${ICA_ROI_INPUT}" ]; then
-    ROIS_PROVIDED=true
-    echo "Pre-existing ROIs provided. Skipping auto-ROI generation."
-
-    for f in "${ACA_ROI_INPUT}" "${ICA_ROI_INPUT}"; do
-        if [ ! -f "${f}" ]; then echo "[ERROR] Provided ROI file not found: ${f}" >&2; exit 1; fi
-    done
-    if [ -z "${ACA_ROI_INPUT_SPACE}" ] || [ -z "${ICA_ROI_INPUT_SPACE}" ]; then
-        echo "[ERROR] When providing --aca-roi/--ica-roi, --aca-roi-space/--ica-roi-space (dimac or tof) must also be specified." >&2
-        exit 1
-    fi
-    if ! [[ "${ACA_ROI_INPUT_SPACE}" =~ ^(dimac|tof)$ ]] || ! [[ "${ICA_ROI_INPUT_SPACE}" =~ ^(dimac|tof)$ ]]; then
-        echo "[ERROR] ROI space must be 'dimac' or 'tof'." >&2
-        exit 1
-    fi
-else
-    echo "No pre-existing ROIs provided. Auto-generating ROIs."
-    if [ -z "${ACA_TERRITORY_MASK}" ]; then echo "[ERROR] --aca-mask is required for auto-ROI generation." >&2; exit 1; fi
-    if [ -z "${ICA_TERRITORY_MASK}" ]; then echo "[ERROR] --ica-mask is required for auto-ROI generation." >&2; exit 1; fi
-    for f in "${ACA_TERRITORY_MASK}" "${ICA_TERRITORY_MASK}"; do
-        if [ ! -f "${f}" ]; then echo "[ERROR] Required territory mask not found: ${f}" >&2; exit 1; fi
-    done
-fi
-
-echo "All essential checks passed. Starting pipeline..."
-
-# Create output directories if they don't exist
-mkdir -p "${DERIV_DIR}/resampled_to_tof" "${OUT_DIR}"
-
-# ==============================================================================
-# --- PIPELINE STEPS ---
-# ==============================================================================
-
 echo
 echo "================================================="
-echo " STEP 1: Resample TOF to be isotropic"
+echo " STEP 1: Resample TOF to isotropic"
 echo "================================================="
-TOF_ISOTROPIC="${DERIV_DIR}/$(basename "${TOF_RAW}" .nii.gz)_isotropic.nii.gz"
-python "${SCRIPT_DIR}/tof_resampler.py" \
-    --tof "${TOF_RAW}" \
-    --out "${TOF_ISOTROPIC}"
+TOF_ISOTROPIC="${DERIV_DIR}/${SUB_ID}_$(basename "${TOF_RAW}" .nii.gz)_isotropic.nii.gz"
+if [[ -f "$TOF_ISOTROPIC" ]]; then
+  echo "[SKIP] Isotropic TOF exists: $TOF_ISOTROPIC"
+else
+  python "${SCRIPT_DIR}/tof_resampler.py" --tof "${TOF_RAW}" --out "${TOF_ISOTROPIC}"
+fi
 
+# ==============================================================================
+# STEP 2: Frangi vesselness
+# ==============================================================================
 echo
 echo "================================================="
 echo " STEP 2: Calculate Vesselness from Isotropic TOF"
 echo "================================================="
-VESSELNESS_PREFIX="${OUT_DIR}/tof_vesselness"
-python "${SCRIPT_DIR}/vessel_cli.py" \
-  --input "${TOF_ISOTROPIC}" \
-  --output-prefix "${VESSELNESS_PREFIX}" \
-  --normalize \
-  --method frangi \
-  --scales-mm ${VESSELNESS_SCALES} \
-  --oof-bright \
-  --thr-mode quantile \
-  --thr-value-frangi 0.995
-
-# Define the path to the Frangi map needed for the final step
+VESSELNESS_PREFIX="${OUT_DIR}/${SUB_ID}_tof_vesselness"
 FRANGI_VESSELNESS="${VESSELNESS_PREFIX}_frangi_vesselness.nii.gz"
+FRANGI_MASK="${VESSELNESS_PREFIX}_frangi_mask.nii.gz"
 
-# --- Conditional ROI Generation / Definition ---
-CURRENT_ACA_ROI_PATH=""
-CURRENT_ICA_ROI_PATH=""
+if [[ -f "$FRANGI_VESSELNESS" && -f "$FRANGI_MASK" ]]; then
+  echo "[SKIP] Frangi outputs exist."
+else
+  python "${SCRIPT_DIR}/vessel_cli.py" \
+    --input "${TOF_ISOTROPIC}" \
+    --output-prefix "${VESSELNESS_PREFIX}" \
+    --normalize \
+    --method frangi \
+    --scales-mm ${VESSELNESS_SCALES}
+fi
 
-if [ "${ROIS_PROVIDED}" = true ]; then
-    echo
-    echo "================================================="
-    echo " STEP 3: Using pre-existing ROIs"
-    echo "================================================="
-    CURRENT_ACA_ROI_PATH="${ACA_ROI_INPUT}"
-    CURRENT_ICA_ROI_PATH="${ICA_ROI_INPUT}"
-    echo "  - ACA ROI input: ${CURRENT_ACA_ROI_PATH} (space: ${ACA_ROI_INPUT_SPACE})"
-    echo "  - ICA ROI input: ${CURRENT_ICA_ROI_PATH} (space: ${ICA_ROI_INPUT_SPACE})"
+# ==============================================================================
+# STEP 3: Build (or use) ROIs in DIMAC space
+# ==============================================================================
+echo
+echo "================================================="
+echo " STEP 3: Generate ACA & ICA ROIs in DIMAC space (NO vessel mask)"
+echo "================================================="
 
-else # ROIs need to be generated
-    echo
-    echo "================================================="
-    echo " STEP 3: Generate ACA & ICA ROIs in DIMAC space"
-    echo "================================================="
-    # Generate ACA ROI
+ROIS_PROVIDED=false
+[[ -n "$ACA_ROI_INPUT" && -f "$ACA_ROI_INPUT" && -n "$ICA_ROI_INPUT" && -f "$ICA_ROI_INPUT" ]] && ROIS_PROVIDED=true
+
+if $ROIS_PROVIDED; then
+  CURRENT_ACA_ROI_PATH="$ACA_ROI_INPUT"
+  CURRENT_ICA_ROI_PATH="$ICA_ROI_INPUT"
+  echo "[INFO] Provided ROIs:"
+  echo "  - ACA: $CURRENT_ACA_ROI_PATH (auto-detecting space...)"
+  echo "  - ICA: $CURRENT_ICA_ROI_PATH (auto-detecting space...)"
+else
+  CURRENT_ACA_ROI_PATH="${DERIV_DIR}/${SUB_ID}_ACA_generated_roi.nii.gz"
+  CURRENT_ICA_ROI_PATH="${DERIV_DIR}/${SUB_ID}_ICA_generated_roi.nii.gz"
+
+  if [[ -f "$CURRENT_ACA_ROI_PATH" && $(vox "$CURRENT_ACA_ROI_PATH") -gt 0 ]]; then
+    echo "[SKIP] ACA ROI already generated (vox>0)."
+  else
     python "${SCRIPT_DIR}/dimac_auto_roi_improved.py" \
       --dimac "${DIMAC_ACA_BOLD}" \
       --out "${DERIV_DIR}/${SUB_ID}_ACA_generated" \
-      --vessel-mask "${ACA_TERRITORY_MASK}" \
       --auto-band --welch-in-gate \
-      --k ${K_CLUSTERS} --ppr-thr ${PPR_THR}
-    CURRENT_ACA_ROI_PATH="${DERIV_DIR}/${SUB_ID}_ACA_generated_roi.nii.gz"
-    ACA_ROI_INPUT_SPACE="dimac" # Generated ROIs are always in DIMAC space
+      --k ${K_CLUSTERS} --ppr-thr 3 \
+      --center-frac 0.5 \
+      --min-voxels 200
+  fi
 
-    # Generate ICA ROI
+  if [[ -f "$CURRENT_ICA_ROI_PATH" && $(vox "$CURRENT_ICA_ROI_PATH") -gt 0 ]]; then
+    echo "[SKIP] ICA ROI already generated (vox>0)."
+  else
     python "${SCRIPT_DIR}/dimac_auto_roi_improved.py" \
       --dimac "${DIMAC_ICA_BOLD}" \
       --out "${DERIV_DIR}/${SUB_ID}_ICA_generated" \
-      --vessel-mask "${ICA_TERRITORY_MASK}" \
       --auto-band --welch-in-gate \
       --k ${K_CLUSTERS} --ppr-thr ${PPR_THR}
-    CURRENT_ICA_ROI_PATH="${DERIV_DIR}/${SUB_ID}_ICA_generated_roi.nii.gz"
-    ICA_ROI_INPUT_SPACE="dimac" # Generated ROIs are always in DIMAC space
-
-    echo "  - Generated ACA ROI: ${CURRENT_ACA_ROI_PATH}"
-    echo "  - Generated ICA ROI: ${CURRENT_ICA_ROI_PATH}"
+  fi
 fi
 
+# QC
+[[ $(vox "$CURRENT_ACA_ROI_PATH") -gt 0 ]] || { echo "[ERROR] ACA ROI empty."; exit 1; }
+[[ $(vox "$CURRENT_ICA_ROI_PATH") -gt 0 ]] || { echo "[ERROR] ICA ROI empty."; exit 1; }
 
+# ==============================================================================
+# STEP 4: Regrid ROIs to isotropic TOF
+# ==============================================================================
 echo
 echo "================================================="
 echo " STEP 4: Resample ROIs to Isotropic TOF Space"
 echo "================================================="
-
-# Define final output paths for the resampled ROIs
 ACA_ROI_FINAL_TOF="${DERIV_DIR}/resampled_to_tof/${SUB_ID}_ACA_roi_in_TOF_iso_space.nii.gz"
 ICA_ROI_FINAL_TOF="${DERIV_DIR}/resampled_to_tof/${SUB_ID}_ICA_roi_in_TOF_iso_space.nii.gz"
 
-# The resample_dimac_to_tof.py script is designed to take DIMAC BOLDs and
-# masks and resample them to a TOF reference. It can also handle masks that
-# are already in TOF space (it will simply resample them to the *specific*
-# TOF reference grid, e.g., isotropic TOF). We pass the original DIMAC bold
-# as a placeholder for context, even if the mask is already TOF-space.
-python "${SCRIPT_DIR}/resample_dimac_to_tof.py" \
-    --tof "${TOF_ISOTROPIC}" \
-    --aca-bold "${DIMAC_ACA_BOLD}" \
-    --aca-mask "${CURRENT_ACA_ROI_PATH}" \
-    --ica-bold "${DIMAC_ICA_BOLD}" \
-    --ica-mask "${CURRENT_ICA_ROI_PATH}" \
-    --output-dir "${DERIV_DIR}/resampled_to_tof"
+# detect spaces (checks against: TOF_ISO, TOF_RAW, ACA_DIMAC, ICA_DIMAC)
+ACA_SPACE=$(detect_roi_space "$CURRENT_ACA_ROI_PATH")
+ICA_SPACE=$(detect_roi_space "$CURRENT_ICA_ROI_PATH")
+echo "  - Detected ACA ROI space: $ACA_SPACE"
+echo "  - Detected ICA ROI space: $ICA_SPACE"
 
-# NOTE: The 'resample_dimac_to_tof.py' script currently uses a fixed naming
-# convention like "_mean_in_TOF_space.nii.gz" or "_in_TOF_space.nii.gz" for masks.
-# We need to correctly identify its output path based on its internal logic.
-# Assuming output names are based on input base name with "_in_TOF_space.nii.gz" suffix.
-# We need to adjust these paths if 'resample_dimac_to_tof.py' uses different naming.
-# Let's verify and override if needed.
-TEMP_ACA_OUTPUT_FROM_RESAMPLE="${DERIV_DIR}/resampled_to_tof/$(basename "${CURRENT_ACA_ROI_PATH}" .nii.gz)_in_TOF_space.nii.gz"
-TEMP_ICA_OUTPUT_FROM_RESAMPLE="${DERIV_DIR}/resampled_to_tof/$(basename "${CURRENT_ICA_ROI_PATH}" .nii.gz)_in_TOF_space.nii.gz"
+# If already in TOF_ISO → copy; else → resample
+need_resample=false
+if [[ "$ACA_SPACE" == "TOF_ISO" ]]; then
+  copy_if_exists "$CURRENT_ACA_ROI_PATH" "$ACA_ROI_FINAL_TOF"
+else
+  need_resample=true
+fi
+if [[ "$ICA_SPACE" == "TOF_ISO" ]]; then
+  copy_if_exists "$CURRENT_ICA_ROI_PATH" "$ICA_ROI_FINAL_TOF"
+else
+  need_resample=true
+fi
 
-# Move and rename for consistency
-mv "${TEMP_ACA_OUTPUT_FROM_RESAMPLE}" "${ACA_ROI_FINAL_TOF}"
-mv "${TEMP_ICA_OUTPUT_FROM_RESAMPLE}" "${ICA_ROI_FINAL_TOF}"
+if $need_resample; then
+  if [[ ! -f "$ACA_ROI_FINAL_TOF" || $(vox "$ACA_ROI_FINAL_TOF") -eq 0 || \
+        ! -f "$ICA_ROI_FINAL_TOF" || $(vox "$ICA_ROI_FINAL_TOF") -eq 0 ]]; then
+    python "${SCRIPT_DIR}/resample_dimac_to_tof.py" \
+      --tof "${TOF_ISOTROPIC}" \
+      --aca-bold "${DIMAC_ACA_BOLD}" \
+      --aca-mask "${CURRENT_ACA_ROI_PATH}" \
+      --ica-bold "${DIMAC_ICA_BOLD}" \
+      --ica-mask "${CURRENT_ICA_ROI_PATH}" \
+      --output-dir "${DERIV_DIR}/resampled_to_tof"
+    # rename to canonical names
+    mv -f "${DERIV_DIR}/resampled_to_tof/$(basename "${CURRENT_ACA_ROI_PATH}" .nii.gz)_in_TOF_space.nii.gz" "$ACA_ROI_FINAL_TOF" || true
+    mv -f "${DERIV_DIR}/resampled_to_tof/$(basename "${CURRENT_ICA_ROI_PATH}" .nii.gz)_in_TOF_space.nii.gz" "$ICA_ROI_FINAL_TOF" || true
+  else
+    echo "[SKIP] Resampled ROIs already present and non-empty."
+  fi
+fi
 
-echo "  - Final ACA ROI (isotropic TOF space): ${ACA_ROI_FINAL_TOF}"
-echo "  - Final ICA ROI (isotropic TOF space): ${ICA_ROI_FINAL_TOF}"
+[[ $(vox "$ACA_ROI_FINAL_TOF") -gt 0 ]] || { echo "[ERROR] ACA ROI empty in TOF iso space."; exit 1; }
+[[ $(vox "$ICA_ROI_FINAL_TOF") -gt 0 ]] || { echo "[ERROR] ICA ROI empty in TOF iso space."; exit 1; }
 
+# ==============================================================================
+# STEP 5: Shortest path + renders
+# ==============================================================================
 echo
 echo "================================================="
 echo " STEP 5: Find Shortest Path and Render Visuals"
 echo "================================================="
-PATH_PREFIX="${OUT_DIR}/aca_ica_path_analysis"
-python "${SCRIPT_DIR}/vessel_shortest_path.py" \
-    --frangi-vesselness "${FRANGI_VESSELNESS}" \
-    --aca-roi "${ACA_ROI_FINAL_TOF}" \
-    --ica-roi "${ICA_ROI_FINAL_TOF}" \
-    --out-prefix "${PATH_PREFIX}" \
-    --invert-weight \
-    --render-png \
-    --render-mode mip \
-    --render-axis y \
-    --render-gif \
-    --gif-frames 60 \
-    --gif-fps 12 \
-    --gif-rotate-mode 3d \
-    --gif-pad \
-    --gif-tilt-deg 24 \
-    --gif-yaw-start_deg 90 \
-    --path-thicken-vox ${PATH_THICKEN_VOX}
+PATH_PREFIX="${OUT_DIR}/${SUB_ID}_aca_ica_path_analysis"
+MASK_NII="${PATH_PREFIX}_path_mask.nii.gz"
+PNG_Y="${PATH_PREFIX}_render_mip_y.png"
+GIF_Y="${PATH_PREFIX}_spin_mip_y.gif"
+
+if [[ -f "$MASK_NII" && -f "$PNG_Y" && -f "$GIF_Y" ]]; then
+  echo "[SKIP] Path + renders already exist."
+else
+  python "${SCRIPT_DIR}/vessel_shortest_path.py" \
+  --frangi-vesselness "${FRANGI_VESSELNESS}" \
+  --aca-roi "${ACA_ROI_FINAL_TOF}" \
+  --ica-roi "${ICA_ROI_FINAL_TOF}" \
+  --out-prefix "${PATH_PREFIX}" \
+  --invert-weight \
+  --render-png \
+  --render-mode mip \
+  --render-axis y \
+  --render-gif \
+  --gif-frames 60 \
+  --gif-fps 12 \
+  --gif-rotate-mode 3d \
+  --gif-pad \
+  --gif-tilt-deg 24 \
+  --gif-yaw-start-deg 90 \
+  --path-thicken-vox ${PATH_THICKEN_VOX} \
+  | tee >(awk -v out="${PATH_PREFIX}_length_mm.txt" '/Geometric path length/{printf "%.3f\n", $(NF-1) > out}')
+
+fi
 
 echo
 echo "================================================="
-echo " Pipeline finished successfully!"
+echo " Pipeline finished!"
+echo "  ACA ROI (TOF iso): $ACA_ROI_FINAL_TOF  (vox: $(vox "$ACA_ROI_FINAL_TOF"))"
+echo "  ICA ROI (TOF iso): $ICA_ROI_FINAL_TOF  (vox: $(vox "$ICA_ROI_FINAL_TOF"))"
+echo "  Path/GIF: ${PATH_PREFIX}_path_mask.nii.gz / ${PATH_PREFIX}_spin_mip_y.gif"
 echo "================================================="
-echo " Final path analysis outputs are in: ${OUT_DIR}"
-echo " Check the GIF at: ${PATH_PREFIX}_spin_mip_y.gif"
-echo "================================================="
+
