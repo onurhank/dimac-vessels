@@ -55,8 +55,8 @@ pip install -r requirements.txt
 
 You will also need:
 
-* [ANTs](http://stnava.github.io/ANTs/) (with `ResampleImageBySpacing`)
-* [FSL](https://fsl.fmrib.ox.ac.uk/fsl/fslwiki) (for `fslhd`, `fslstats`)
+* [ANTs](http://stnava.github.io/ANTs/) (with `ResampleImageBySpacing`, `antsApplyTransforms`)
+* [FSL](https://fsl.fmrib.ox.ac.uk/fsl/fslwiki) (for `fslhd`, `fslstats`, `fslmaths`)
 
 ---
 
@@ -137,9 +137,4 @@ bash run_vessel_analysis.sh \
 * [ ] More documentation & usage examples
 * [ ] Package for PyPI (`pip install dimac-vessels`)
 * [ ] CI/CD with GitHub Actions
-
----
-
-## 📜 License
-
-MIT License © 2025 \[Your Name]
+* [ ] Docker Container
