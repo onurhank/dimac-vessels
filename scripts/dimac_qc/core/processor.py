@@ -124,56 +124,110 @@ class DimacProcessor:
     def _apply_gradient_search(self, rec: ClusterRecord):
         tc_2d = self.dimac_flat[rec.raw_mask_dimac.ravel()]
         rec.tc_2d = tc_2d
-        mean_tc = np.mean(tc_2d, axis=0)
         
-        window = max(3, int(3.0 / self.tr))
-        if window % 2 == 0: window += 1
-        pad_width = window // 2
-        padded = np.pad(mean_tc, pad_width, mode='edge')
-        x_lp = np.convolve(padded, np.ones(window)/window, mode='valid')
+        x = np.mean(tc_2d, axis=0)
+        n = len(x)
         
-        x_hp = mean_tc - x_lp
-        if len(x_hp) >= 21: x_hp = savgol_filter(x_hp, window_length=21, polyorder=5)
+        # 1. EXACT FOURIER LOW-PASS FILTER
+        k = int(np.floor((n * self.tr) / 3.0)) # sinusoid order for 3s cutoff
+        t = np.arange(n)
+        X_mat = np.ones((n, 2 * k + 1))
+        for i in range(1, k + 1):
+            X_mat[:, 2*i - 1] = np.sin(2 * np.pi * i * t / n)
+            X_mat[:, 2*i]     = np.cos(2 * np.pi * i * t / n)
+            
+        # MATLAB regress equivalent: B = (X'X)^-1 X'Y
+        B, _, _, _ = np.linalg.lstsq(X_mat, x, rcond=None)
+        x_lp = X_mat @ B
+        
+        # 2. SAVITZKY-GOLAY SMOOTHING (Matched exactly to sgolayfilt(data, 5, 21))
+        x_hp = x - x_lp
+        if len(x_hp) >= 21: 
+            x_hp = savgol_filter(x_hp, window_length=21, polyorder=5)
 
+        # 3. EXACT ZERO-CROSSING PEAK DETECTION
         thresh = np.nanmean(x_hp) + 0.75 * np.nanstd(x_hp)
-        min_dist = max(1, int(0.5 / self.tr))
-        peaks, _ = find_peaks(x_hp, height=thresh, distance=min_dist)
-        rec.maxind = peaks
+        tempcard = np.where((x_hp - thresh) > 0, x_hp - thresh, 0)
         
+        maxind =[]
+        mx = -np.inf
+        ind = 0
+        for i in range(len(tempcard)):
+            if tempcard[i] > mx:
+                mx = tempcard[i]
+                ind = i
+            # If it returns to 0 and we found a peak during the "island"
+            if tempcard[i] == 0 and mx != 0 and mx != -np.inf:
+                maxind.append(ind)
+                mx = -np.inf
+                
+        # Remove peaks within 0.5 seconds
+        rmThresh = np.ceil(0.5 * (1.0 / self.tr))
+        ii = 0
+        while ii < len(maxind) - 1:
+            inddiff = maxind[ii+1] - maxind[ii]
+            if inddiff < rmThresh:
+                maxind.pop(ii+1)
+            else:
+                ii += 1
+
+        rec.maxind = np.array(maxind)
         Nvox = tc_2d.shape[0]
-        if len(peaks) < 3:
+        
+        # If not enough peaks, fail everything gracefully
+        if len(maxind) < 3:
             rec.custom_voxel_mask = np.ones(Nvox, dtype=bool)
             rec.grad_mask = rec.raw_mask_dimac.copy()
             rec.tc_grad, rec.ppr_grad = rec.tc, rec.ppr
             return
 
-        minind = []; gradfit = []; gradallfit =[]
-        for b in range(1, len(peaks)):
-            prev_peak = peaks[b-1]
-            curr_peak = peaks[b]
+        minind =[]
+        gradfit = []
+        gradallfit =[]
+        
+        for b in range(1, len(maxind)):
+            prev_peak = maxind[b-1]
+            curr_peak = maxind[b]
             beat_len = curr_peak - prev_peak
 
-            search_mg_start = max(prev_peak, curr_peak - int(np.ceil(beat_len / 4.0)))
-            trough = search_mg_start + np.argmin(mean_tc[search_mg_start:curr_peak]) if curr_peak > search_mg_start else search_mg_start
+            # 4. TROUGH DETECTION (Inclusive + Last Minimum Tie-Breaker)
+            search_mg_start = curr_peak - int(np.ceil(beat_len / 4.0))
+            search_mg_start = max(prev_peak, search_mg_start)
+            
+            # Slice +1 to emulate MATLAB inclusive indexing
+            window = x[search_mg_start : curr_peak + 1] 
+            
+            # Get the *last* minimum in case of ties
+            min_val = np.min(window)
+            last_min_idx = np.where(window == min_val)[0][-1] 
+            trough = search_mg_start + last_min_idx
             minind.append(trough)
 
-            search_grad_start = max(prev_peak, curr_peak - int(np.ceil(beat_len / 2.0)))
+            # 5. GRADIENT CALCULATION
+            search_grad_start = curr_peak - int(np.ceil(beat_len / 2.0))
+            search_grad_start = max(prev_peak, search_grad_start)
+            
+            # Local slope (Halfway to trough)
             N_loc = trough - search_grad_start + 1
             if N_loc > 1:
                 x_loc = np.arange(N_loc)
                 x_c = x_loc - np.mean(x_loc)
                 ss_xx = np.sum(x_c**2)
-                m_loc = np.sum(x_c * tc_2d[:, search_grad_start:trough+1], axis=1) / ss_xx if ss_xx > 0 else np.zeros(Nvox)
+                # Slice +1 for inclusive
+                y_loc = tc_2d[:, search_grad_start : trough + 1]
+                m_loc = np.sum(x_c * y_loc, axis=1) / ss_xx if ss_xx > 0 else np.zeros(Nvox)
             else:
                 m_loc = np.zeros(Nvox)
             gradfit.append(m_loc)
 
+            # Global slope (Previous peak to trough)
             N_all = trough - prev_peak + 1
             if N_all > 1:
                 x_all = np.arange(N_all)
                 x_c = x_all - np.mean(x_all)
                 ss_xx = np.sum(x_c**2)
-                m_all = np.sum(x_c * tc_2d[:, prev_peak:trough+1], axis=1) / ss_xx if ss_xx > 0 else np.zeros(Nvox)
+                y_all = tc_2d[:, prev_peak : trough + 1]
+                m_all = np.sum(x_c * y_all, axis=1) / ss_xx if ss_xx > 0 else np.zeros(Nvox)
             else:
                 m_all = np.zeros(Nvox)
             gradallfit.append(m_all)
@@ -182,6 +236,7 @@ class DimacProcessor:
         rec.gradfit = np.array(gradfit)
         rec.gradallfit = np.array(gradallfit)
 
+        # 6. MASK CREATION (ratio between 0.4 and 2.0, local grad < 0)
         with np.errstate(divide='ignore', invalid='ignore'):
             gradratio = np.where(rec.gradallfit != 0, rec.gradfit / rec.gradallfit, 0)
         rec.gradratio = gradratio
@@ -194,6 +249,7 @@ class DimacProcessor:
         rec.grad_pass_fraction = float(np.mean(rec.pass_frac))
         rec.mask_survival_fraction = float(np.sum(passed_voxels_mask) / Nvox)
 
+        # Apply mask
         if not np.any(passed_voxels_mask):
             rec.grad_mask, rec.tc_grad, rec.ppr_grad = rec.raw_mask_dimac.copy(), rec.tc, rec.ppr
         else:
