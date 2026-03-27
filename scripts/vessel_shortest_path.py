@@ -415,19 +415,27 @@ def main():
     if aca.sum() == 0 or ica.sum() == 0:
         raise RuntimeError("ACA or ICA has no voxels inside finite-cost region. Relax/dilate the mask or omit --frangi-mask.")
 
-    # Find path
-    # Find geometric centers (centroids)
-    aca_centroid = np.round(center_of_mass(aca)).astype(int)
-    ica_centroid = np.round(center_of_mass(ica)).astype(int)
+    # 1. Find raw geometric centers (can float in empty space)
+    aca_centroid = center_of_mass(aca)
+    ica_centroid = center_of_mass(ica)
 
-    # Set start to the single ACA center voxel
-    starts = [tuple(aca_centroid)]
+    # 2. Find the ACTUAL valid vessel voxel closest to that geometric center
+    aca_coords = np.argwhere(aca)
+    aca_best_idx = np.argmin(np.sum((aca_coords - aca_centroid)**2, axis=1))
+    aca_center_voxel = tuple(aca_coords[aca_best_idx])
 
-    # Create a single-voxel goal mask for the ICA center
+    ica_coords = np.argwhere(ica)
+    ica_best_idx = np.argmin(np.sum((ica_coords - ica_centroid)**2, axis=1))
+    ica_center_voxel = tuple(ica_coords[ica_best_idx])
+
+    # 3. Set start to that single best ACA voxel
+    starts = [aca_center_voxel]
+
+    # 4. Create a single-voxel goal mask for the best ICA voxel
     goals_map = np.zeros_like(ica, dtype=bool)
-    goals_map[tuple(ica_centroid)] = True
+    goals_map[ica_center_voxel] = True
 
-    # Find path between the two exact centers
+    # 5. Find path between these two exact points
     path_xyz, costs = find_path_mcp(cost, starts, goals_map)
 
     # Path mask and length
