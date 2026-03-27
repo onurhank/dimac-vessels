@@ -4,7 +4,8 @@ import numpy as np
 import nibabel as nib
 import imageio
 from scipy.ndimage import rotate as nd_rotate
-
+from scipy.ndimage import center_of_mass
+import numpy as np
 from skimage.graph import MCP_Geometric
 from nibabel.processing import resample_from_to
 from scipy.ndimage import binary_dilation, binary_erosion
@@ -415,8 +416,18 @@ def main():
         raise RuntimeError("ACA or ICA has no voxels inside finite-cost region. Relax/dilate the mask or omit --frangi-mask.")
 
     # Find path
-    starts = [tuple(x) for x in np.argwhere(aca)]
-    goals_map = ica
+    # Find geometric centers (centroids)
+    aca_centroid = np.round(center_of_mass(aca)).astype(int)
+    ica_centroid = np.round(center_of_mass(ica)).astype(int)
+
+    # Set start to the single ACA center voxel
+    starts = [tuple(aca_centroid)]
+
+    # Create a single-voxel goal mask for the ICA center
+    goals_map = np.zeros_like(ica, dtype=bool)
+    goals_map[tuple(ica_centroid)] = True
+
+    # Find path between the two exact centers
     path_xyz, costs = find_path_mcp(cost, starts, goals_map)
 
     # Path mask and length
